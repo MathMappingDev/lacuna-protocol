@@ -1,0 +1,11 @@
+node_modules
+cache
+artifacts
+typechain-types
+dist
+.env
+circuits/build/*.ptau
+circuits/build/*.r1cs
+circuits/build/*.sym
+circuits/build/*_0000.zkey
+tools

@@ -1,0 +1,26 @@
+{
+  "name": "lacuna-protocol",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lacuna privacy pool and local proving SDK",
+  "scripts": {
+    "circuits": "node scripts/build-circuits.mjs",
+    "compile": "hardhat compile",
+    "deploy:sepolia": "hardhat run scripts/deploy-sepolia.ts --network sepolia",
+    "test": "node scripts/build-circuits.mjs && hardhat test"
+  },
+  "dependencies": {
+    "@noble/curves": "^1.9.2",
+    "@openzeppelin/contracts": "^4.9.6",
+    "circomlib": "^2.0.5",
+    "circomlibjs": "^0.1.7",
+    "poseidon-solidity": "^0.0.5"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.26.0",
+    "snarkjs": "^0.7.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  }
+}
