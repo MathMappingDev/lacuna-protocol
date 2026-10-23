@@ -1,8 +1,9 @@
+import { appendFileSync } from "fs";
 import { AbiCoder, Contract, ZeroAddress, keccak256, type Provider, type Signer, type TransactionReceipt } from "ethers";
-import { FIELD, splitGross } from "./constants";
+import { FIELD, minProtocolFee, splitGross } from "./constants";
 import type { LacunaKeys } from "./keys";
 import { decryptNote, encryptNote, type NoteBody } from "./note";
-import { commitmentOf, getHasher, nullifierOf } from "./poseidon";
+import { commitmentOf, getHasher, hash2, nullifierOf } from "./poseidon";
 import {
   emptySpend,
   proveTransact,
@@ -13,11 +14,13 @@ import {
 import { NoteForest } from "./tree";
 
 export const poolAbi = [
-  "function shieldETH(uint256 npk, uint256 blinding, bytes ciphertext) payable",
-  "function shieldERC20(address token, uint256 amount, uint256 npk, uint256 blinding, bytes ciphertext)",
-  "function shieldERC721(address collection, uint256 id, uint256 npk, uint256 blinding, bytes ciphertext)",
+  "function shieldETH(uint256 ownerHash, bytes ciphertext) payable",
+  "function shieldERC20(address token, uint256 amount, uint256 ownerHash, bytes ciphertext)",
+  "function shieldERC721(address collection, uint256 id, uint256 ownerHash, bytes ciphertext)",
   "function nftId(address collection, uint256 id) pure returns (uint256)",
-  "function transact(uint256[2] pA, uint256[2][2] pB, uint256[2] pC, uint256[16] pubSignals, bytes ciphertext0, bytes ciphertext1, tuple(address collection, uint256 id) nft0, tuple(address collection, uint256 id) nft1)",
+  "function feeBalance(uint256 token) view returns (uint256)",
+  "function withdrawFees(address token)",
+  "function transact(uint256[2] pA, uint256[2][2] pB, uint256[2] pC, uint256[17] pubSignals, bytes ciphertext0, bytes ciphertext1, tuple(address collection, uint256 id) nft0, tuple(address collection, uint256 id) nft1)",
   "function currentRoot() view returns (uint256)",
   "function nextIndex() view returns (uint256)",
   "function poolBalance(uint256 token) view returns (uint256)",
@@ -40,10 +43,21 @@ export type ShieldPlan = {
   token: string;
   tokenId?: bigint;
   nft?: boolean;
-  npk: bigint;
-  blinding: bigint;
+  ownerHash: bigint;
   ciphertext: string;
 };
+
+const LOG_SPAN = 9_000;
+
+async function queryLogs(contract: Contract, filter: Parameters<Contract["queryFilter"]>[0], provider: Provider) {
+  const latest = await provider.getBlockNumber();
+  const logs = [];
+  for (let from = 0; from <= latest; from += LOG_SPAN) {
+    const to = Math.min(latest, from + LOG_SPAN - 1);
+    logs.push(...(await contract.queryFilter(filter, from, to)));
+  }
+  return logs;
+}
 
 export type NftLeg = { collection: string; id: bigint };
 
@@ -60,7 +74,7 @@ export function callCommitment(calls: ContractCall[], shields: ShieldPlan[]): bi
   const encoded = AbiCoder.defaultAbiCoder().encode(
     [
       "tuple(address target, uint256 value, bytes data)[]",
-      "tuple(address token, uint256 tokenId, bool nft, uint256 npk, uint256 blinding, bytes ciphertext)[]",
+      "tuple(address token, uint256 tokenId, bool nft, uint256 ownerHash, bytes ciphertext)[]",
     ],
     [
       calls.map((call) => [call.target, call.value, call.data]),
@@ -68,8 +82,7 @@ export function callCommitment(calls: ContractCall[], shields: ShieldPlan[]): bi
         shield.token,
         shield.tokenId ?? 0n,
         shield.nft ?? false,
-        shield.npk,
-        shield.blinding,
+        shield.ownerHash,
         shield.ciphertext,
       ]),
     ],
@@ -77,11 +90,16 @@ export function callCommitment(calls: ContractCall[], shields: ShieldPlan[]): bi
   return BigInt(keccak256(encoded)) % FIELD;
 }
 
+export function ciphertextHash(first: string, second: string): bigint {
+  const encoded = AbiCoder.defaultAbiCoder().encode(["bytes", "bytes"], [first, second]);
+  return BigInt(keccak256(encoded)) % FIELD;
+}
+
 export async function loadTree(provider: Provider, pool: string): Promise<NoteForest> {
   const hash2 = await getHasher();
   const forest = new NoteForest(hash2);
   const contract = poolContract(pool, provider);
-  const logs = await contract.queryFilter(contract.filters.Note());
+  const logs = await queryLogs(contract, contract.filters.Note(), provider);
   const ordered = logs
     .map((log) => {
       const decoded = contract.interface.decodeEventLog("Note", log.data, log.topics);
@@ -109,8 +127,8 @@ export type ScannedNote = NoteBody & {
 
 export async function scan(provider: Provider, pool: string, keys: LacunaKeys): Promise<ScannedNote[]> {
   const contract = poolContract(pool, provider);
-  const notes = await contract.queryFilter(contract.filters.Note());
-  const spentLogs = await contract.queryFilter(contract.filters.Nullified());
+  const notes = await queryLogs(contract, contract.filters.Note(), provider);
+  const spentLogs = await queryLogs(contract, contract.filters.Nullified(), provider);
   const spent = new Set<string>();
   for (const log of spentLogs) {
     const decoded = contract.interface.decodeEventLog("Nullified", log.data, log.topics);
@@ -122,10 +140,14 @@ export async function scan(provider: Provider, pool: string, keys: LacunaKeys): 
     const decoded = contract.interface.decodeEventLog("Note", log.data, log.topics);
     const ciphertext = String(decoded.ciphertext);
     if (ciphertext === "0x") continue;
-    const body = decryptNote(ciphertext, keys.viewingPrivate);
-    if (!body) continue;
+    const decrypted = decryptNote(ciphertext, keys.viewingPrivate);
+    if (!decrypted) continue;
+    const eventCommitment = BigInt(decoded.commitment);
+    const value = await noteValue(provider, contract, log.transactionHash, decrypted, keys.npk, eventCommitment);
+    if (value == null) continue;
+    const body = { ...decrypted, value };
     const commitment = await commitmentOf(body.value, keys.npk, body.blinding, body.token);
-    if (commitment !== BigInt(decoded.commitment)) continue;
+    if (commitment !== eventCommitment) continue;
     const nullifier = await nullifierOf(keys.spendingKey, commitment);
     found.push({
       ...body,
@@ -167,7 +189,8 @@ export async function shieldEth(input: {
   const contract = poolContract(input.pool, input.signer);
   const { net } = splitGross(input.gross, BigInt(await contract.shieldFeeBps()));
   const ciphertext = encryptNote({ value: net, blinding: input.blinding, token: 0n }, input.viewingPublic);
-  const tx = await contract.shieldETH(input.npk, input.blinding, ciphertext, {
+  const ownerHash = await hash2(input.npk, input.blinding);
+  const tx = await contract.shieldETH(ownerHash, ciphertext, {
     value: input.gross,
   });
   return tx.wait();
@@ -189,17 +212,20 @@ export async function shieldToken(input: {
     { value: net, blinding: input.blinding, token: tokenId },
     input.viewingPublic,
   );
-  const tx = await contract.shieldERC20(
-    input.token,
-    input.gross,
-    input.npk,
-    input.blinding,
-    ciphertext,
-  );
+  const ownerHash = await hash2(input.npk, input.blinding);
+  const tx = await contract.shieldERC20(input.token, input.gross, ownerHash, ciphertext);
   return tx.wait();
 }
 
-export type Submitted = { receipt: TransactionReceipt; proof: ProofCall };
+export type OutputSecret = {
+  value: string;
+  blinding: string;
+  token: string;
+  npk: string;
+  ciphertext: string;
+};
+
+export type Submitted = { receipt: TransactionReceipt; proof: ProofCall; outputs: OutputSecret[] };
 
 export async function submitTransact(input: {
   signer: Signer;
@@ -221,13 +247,14 @@ export async function submitTransact(input: {
   externalHash?: bigint;
   nft0?: NftLeg;
   nft1?: NftLeg;
+  secretFile?: string;
 }): Promise<Submitted> {
   const contract = poolContract(input.pool, input.signer);
   const feeBps = BigInt(await contract.unshieldFeeBps());
-  const first = splitExit(input.publicAmount ?? 0n, input.protocolFee, feeBps);
-  const second = splitExit(input.publicAmount1 ?? 0n, input.protocolFee1, feeBps);
-  const twoTokens = input.twoTokens ?? (input.token1 != null || second.publicAmount > 0n || input.nft1 != null);
   const relayFee = input.relayFee ?? 0n;
+  const first = splitExit(input.publicAmount ?? 0n, input.protocolFee, feeBps, relayFee);
+  const second = splitExit(input.publicAmount1 ?? 0n, input.protocolFee1, feeBps, 0n);
+  const twoTokens = input.twoTokens ?? (input.token1 != null || second.publicAmount > 0n || input.nft1 != null);
   const relayRecipient = input.relayRecipient ? BigInt(input.relayRecipient) : 0n;
   if ((relayFee === 0n) !== (relayRecipient === 0n)) {
     throw new Error("A submission tip needs the wallet that receives it");
@@ -245,9 +272,21 @@ export async function submitTransact(input: {
     protocolFee1: second.protocolFee,
     relayRecipient,
     externalHash: input.externalHash ?? 0n,
+    ciphertextHash: ciphertextHash(input.ciphertexts[0], input.ciphertexts[1]),
     inputs: input.inputs,
     outputs: input.outputs,
   });
+  const outputs = input.outputs.map((note, index) => ({
+    value: (note.enabled ? note.value : 0n).toString(),
+    blinding: note.blinding.toString(),
+    token: (note.token ?? input.token).toString(),
+    npk: note.npk.toString(),
+    ciphertext: input.ciphertexts[index],
+  }));
+  appendFileSync(
+    input.secretFile ?? "lacuna-output-secrets.json",
+    `${JSON.stringify({ savedAt: new Date().toISOString(), outputs })}\n`,
+  );
   const tx = await contract.transact(
     proof.pA,
     proof.pB,
@@ -258,17 +297,47 @@ export async function submitTransact(input: {
     input.nft0 ?? emptyNft,
     input.nft1 ?? emptyNft,
   );
-  return { receipt: await tx.wait(), proof };
+  return { receipt: await tx.wait(), proof, outputs };
+}
+
+async function noteValue(
+  provider: Provider,
+  contract: Contract,
+  transactionHash: string,
+  body: NoteBody,
+  npk: bigint,
+  eventCommitment: bigint,
+): Promise<bigint | null> {
+  if ((await commitmentOf(body.value, npk, body.blinding, body.token)) === eventCommitment) return body.value;
+  const receipt = await provider.getTransactionReceipt(transactionHash);
+  if (!receipt) return null;
+  for (const entry of receipt.logs) {
+    try {
+      const decoded = contract.interface.decodeEventLog("Shielded", entry.data, entry.topics);
+      if (BigInt(decoded.token) !== body.token) continue;
+      const net = BigInt(decoded.gross) - BigInt(decoded.fee);
+      if ((await commitmentOf(net, npk, body.blinding, body.token)) === eventCommitment) return net;
+    } catch {
+      continue;
+    }
+  }
+  if ((await commitmentOf(1n, npk, body.blinding, body.token)) === eventCommitment) return 1n;
+  return null;
 }
 
 function splitExit(
   requested: bigint,
   protocolFee: bigint | undefined,
   feeBps: bigint,
+  relayFee: bigint,
 ): { publicAmount: bigint; protocolFee: bigint } {
-  if (protocolFee == null && requested > 0n) {
+  if (protocolFee != null) return { publicAmount: requested, protocolFee };
+  if (requested === 0n && relayFee === 0n) return { publicAmount: 0n, protocolFee: 0n };
+  if (relayFee === 0n) {
     const split = splitGross(requested, feeBps);
     return { publicAmount: split.net, protocolFee: split.fee };
   }
-  return { publicAmount: requested, protocolFee: protocolFee ?? 0n };
+  const recipient = requested === 0n ? { net: 0n, fee: 0n } : splitGross(requested, feeBps);
+  const combined = minProtocolFee(recipient.net + relayFee, feeBps);
+  return { publicAmount: recipient.net, protocolFee: combined > recipient.fee ? combined : recipient.fee };
 }

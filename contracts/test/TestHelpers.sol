@@ -30,6 +30,28 @@ contract TestToken {
     }
 }
 
+/// @notice Delivers one unit less than requested. The pool must reject it.
+contract TestTaxToken {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount - 1;
+        return true;
+    }
+}
+
 /// @notice Returns nine tenths of the ETH it receives. Used to exercise the relay.
 contract TestSink {
     function bounce() external payable {

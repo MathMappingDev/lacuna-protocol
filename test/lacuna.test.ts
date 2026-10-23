@@ -1,8 +1,9 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
-import { splitGross } from "../sdk/src/constants";
+import { minProtocolFee, splitGross } from "../sdk/src/constants";
 import {
   callCommitment,
+  ciphertextHash,
   createWallet,
   decryptNote,
   emptyOutput,
@@ -68,11 +69,14 @@ describe("Lacuna pool", function () {
   });
 
   it("shields, sends privately, pays a broadcaster, unshields, and relays a call", async function () {
-    const [, treasury, aliceSigner, bobSigner, broadcaster] = await ethers.getSigners();
+    const [owner, treasury, aliceSigner, bobSigner, broadcaster] = await ethers.getSigners();
     const alice = await createWallet();
     const bob = await keysFromPhrase((await createWallet()).phrase);
     expect(parseAddress(alice.address).npk).to.equal(alice.npk);
     expect(alice.address.startsWith("0LcnZK")).to.equal(true);
+    expect(alice.address).to.have.length(142);
+    const flipped = `${alice.address.slice(0, -1)}${alice.address.endsWith("0") ? "1" : "0"}`;
+    expect(() => parseAddress(flipped)).to.throw(/checksum/);
 
     const { pool } = await deployCore(treasury.address);
     const poolAddress = await pool.getAddress();
@@ -93,7 +97,16 @@ describe("Lacuna pool", function () {
       viewingPublic: alice.viewingPublic,
     });
     expect(await pool.poolBalance(0)).to.equal(shielded.net);
-    expect(await ethers.provider.getBalance(treasury.address) - treasuryBefore).to.equal(shielded.fee);
+    expect(await pool.feeBalance(0)).to.equal(shielded.fee);
+    expect(await ethers.provider.getBalance(treasury.address)).to.equal(treasuryBefore);
+    await expect(pool.connect(owner).withdrawFees(ethers.ZeroAddress)).to.be.revertedWithCustomError(pool, "NotTreasury");
+    await expect(pool.connect(aliceSigner).withdrawFees(ethers.ZeroAddress)).to.be.revertedWithCustomError(pool, "NotTreasury");
+    const withdrawTx = await pool.connect(treasury).withdrawFees(ethers.ZeroAddress);
+    const withdrawReceipt = await withdrawTx.wait();
+    const withdrawGas = withdrawReceipt!.gasUsed * (withdrawReceipt!.gasPrice ?? 0n);
+    expect(await ethers.provider.getBalance(treasury.address)).to.equal(treasuryBefore + shielded.fee - withdrawGas);
+    expect(await pool.feeBalance(0)).to.equal(0n);
+    expect(await pool.poolBalance(0)).to.equal(shielded.net);
 
     let tree = await loadTree(ethers.provider, poolAddress);
     expect(tree.tree(0).path(0).root).to.equal(await pool.currentRoot());
@@ -104,9 +117,18 @@ describe("Lacuna pool", function () {
 
     const payment = 4n * 10n ** 17n;
     const relayFee = 10n ** 16n;
-    const changeValue = shielded.net - payment - relayFee;
+    const tipFee = minProtocolFee(relayFee);
+    const changeValue = shielded.net - payment - relayFee - tipFee;
     const paymentNote = outputOf(payment, bob.npk, randomBlinding());
     const changeNote = outputOf(changeValue, alice.npk, randomBlinding());
+    const paymentCiphertext = encryptNote(
+      { value: payment, blinding: paymentNote.blinding, token: 0n },
+      bob.viewingPublic,
+    );
+    const changeCiphertext = encryptNote(
+      { value: changeValue, blinding: changeNote.blinding, token: 0n },
+      alice.viewingPublic,
+    );
     const broadcasterBefore = await ethers.provider.getBalance(broadcaster.address);
     const sent = await submitTransact({
       signer: broadcaster,
@@ -115,16 +137,14 @@ describe("Lacuna pool", function () {
       token: 0n,
       inputs: [await spendable(alice, aliceNotes[0], tree), emptySpend()],
       outputs: [paymentNote, changeNote],
-      ciphertexts: [
-        encryptNote({ value: payment, blinding: paymentNote.blinding, token: 0n }, bob.viewingPublic),
-        encryptNote({ value: changeValue, blinding: changeNote.blinding, token: 0n }, alice.viewingPublic),
-      ],
+      ciphertexts: [paymentCiphertext, changeCiphertext],
       relayFee,
       relayRecipient: broadcaster.address,
     });
     const gas = sent.receipt.gasUsed * (sent.receipt.gasPrice ?? 0n);
     expect(await ethers.provider.getBalance(broadcaster.address)).to.equal(broadcasterBefore + relayFee - gas);
-    expect(await pool.poolBalance(0)).to.equal(shielded.net - relayFee);
+    expect(await pool.poolBalance(0)).to.equal(shielded.net - relayFee - tipFee);
+    expect(await pool.feeBalance(0)).to.equal(tipFee);
 
     await expect(
       pool.connect(broadcaster).transact(
@@ -132,12 +152,25 @@ describe("Lacuna pool", function () {
         sent.proof.pB,
         sent.proof.pC,
         sent.proof.pubSignals,
-        "0x",
-        "0x",
+        paymentCiphertext,
+        changeCiphertext,
         noNft,
         noNft,
       ),
     ).to.be.revertedWithCustomError(pool, "DoubleSpend");
+    const flippedCiphertext = `${paymentCiphertext.slice(0, -1)}${paymentCiphertext.endsWith("0") ? "1" : "0"}`;
+    await expect(
+      pool.connect(broadcaster).transact(
+        sent.proof.pA,
+        sent.proof.pB,
+        sent.proof.pC,
+        sent.proof.pubSignals,
+        flippedCiphertext,
+        changeCiphertext,
+        noNft,
+        noNft,
+      ),
+    ).to.be.revertedWithCustomError(pool, "BadProof");
 
     tree = await loadTree(ethers.provider, poolAddress);
     aliceNotes = await scan(ethers.provider, poolAddress, alice);
@@ -162,7 +195,8 @@ describe("Lacuna pool", function () {
     });
     const bobGas = unshielded.receipt.gasUsed * (unshielded.receipt.gasPrice ?? 0n);
     expect(await ethers.provider.getBalance(bobSigner.address)).to.equal(bobBefore + bobExit.net - bobGas);
-    expect(await ethers.provider.getBalance(treasury.address) - treasuryMid).to.equal(bobExit.fee);
+    expect(await pool.feeBalance(0)).to.equal(tipFee + bobExit.fee);
+    expect(await ethers.provider.getBalance(treasury.address)).to.equal(treasuryMid);
 
     tree = await loadTree(ethers.provider, poolAddress);
     aliceNotes = (await scan(ethers.provider, poolAddress, alice)).filter((note) => !note.spent);
@@ -185,12 +219,15 @@ describe("Lacuna pool", function () {
         token: ethers.ZeroAddress,
         tokenId: 0n,
         nft: false,
-        npk: alice.npk,
-        blinding: reshieldBlinding,
+        ownerHash: await hash2(alice.npk, reshieldBlinding),
         ciphertext: reshieldCiphertext,
       },
     ];
     expect(await pool.callCommitment(bounceCalls, bounceShields)).to.equal(callCommitment(bounceCalls, bounceShields));
+    const swapChangeCiphertext = encryptNote(
+      { value: swapChange, blinding: swapChangeNote.blinding, token: 0n },
+      alice.viewingPublic,
+    );
     const swapProof = await proveTransact({
       root: tree.tree(aliceNotes[0].treeNumber).path(aliceNotes[0].index).root,
       token: 0n,
@@ -200,20 +237,17 @@ describe("Lacuna pool", function () {
       protocolFee: swapOut.fee,
       relayRecipient: 0n,
       externalHash: callCommitment(bounceCalls, bounceShields),
+      ciphertextHash: ciphertextHash(swapChangeCiphertext, "0x"),
       inputs: [await spendable(alice, aliceNotes[0], tree), emptySpend()],
       outputs: [swapChangeNote, emptyOutput()],
     });
-    const changeCiphertext = encryptNote(
-      { value: swapChange, blinding: swapChangeNote.blinding, token: 0n },
-      alice.viewingPublic,
-    );
     await expect(
       relay.transactAndCall(
         swapProof.pA,
         swapProof.pB,
         swapProof.pC,
         swapProof.pubSignals,
-        changeCiphertext,
+        swapChangeCiphertext,
         "0x",
         noNft,
         noNft,
@@ -226,7 +260,7 @@ describe("Lacuna pool", function () {
       swapProof.pB,
       swapProof.pC,
       swapProof.pubSignals,
-      changeCiphertext,
+      swapChangeCiphertext,
       "0x",
       noNft,
       noNft,
@@ -270,7 +304,10 @@ describe("Lacuna pool", function () {
       recipient: aliceSigner.address,
     });
     expect(await token.balanceOf(aliceSigner.address)).to.equal(tokenExit.net);
-    expect(await token.balanceOf(treasury.address)).to.equal(treasuryTokensBefore + tokenExit.fee);
+    expect(await token.balanceOf(treasury.address)).to.equal(treasuryTokensBefore);
+    expect(await pool.feeBalance(BigInt(tokenAddress))).to.equal(tokenShield.fee + tokenExit.fee);
+    await pool.connect(treasury).withdrawFees(tokenAddress);
+    expect(await token.balanceOf(treasury.address)).to.equal(treasuryTokensBefore + tokenShield.fee + tokenExit.fee);
     expect(await pool.poolBalance(BigInt(tokenAddress))).to.equal(0n);
   });
 
@@ -343,8 +380,8 @@ describe("Lacuna pool", function () {
       },
     ];
     const shields = [
-      { token: tokenOutAddress, tokenId: 0n, nft: false, npk: alice.npk, blinding: boughtBlinding, ciphertext: boughtCiphertext },
-      { token: tokenInAddress, tokenId: 0n, nft: false, npk: alice.npk, blinding: leftoverBlinding, ciphertext: leftoverCiphertext },
+      { token: tokenOutAddress, tokenId: 0n, nft: false, ownerHash: await hash2(alice.npk, boughtBlinding), ciphertext: boughtCiphertext },
+      { token: tokenInAddress, tokenId: 0n, nft: false, ownerHash: await hash2(alice.npk, leftoverBlinding), ciphertext: leftoverCiphertext },
     ];
     expect(await pool.callCommitment(calls, shields)).to.equal(callCommitment(calls, shields));
     const proof = await proveTransact({
@@ -356,6 +393,7 @@ describe("Lacuna pool", function () {
       protocolFee: exit.fee,
       relayRecipient: 0n,
       externalHash: callCommitment(calls, shields),
+      ciphertextHash: ciphertextHash("0x", "0x"),
       inputs: [await spendable(alice, note, tree), emptySpend()],
       outputs: [emptyOutput(), emptyOutput()],
     });
@@ -373,7 +411,8 @@ describe("Lacuna pool", function () {
     expect(await tokenOut.balanceOf(relayAddress)).to.equal(0n);
     expect(await tokenIn.balanceOf(relayAddress)).to.equal(0n);
     expect(await bonus.balanceOf(relayAddress)).to.equal(1n);
-    expect(await tokenOut.balanceOf(treasury.address)).to.equal(bought.fee);
+    expect(await tokenOut.balanceOf(treasury.address)).to.equal(0n);
+    expect(await pool.feeBalance(BigInt(tokenOutAddress))).to.equal(bought.fee);
   });
 
   it("opens the next tree and still spends a note from the finished one", async function () {
@@ -526,7 +565,7 @@ describe("Lacuna pool", function () {
         ]),
       },
     ];
-    const shields = [{ token: lpAddress, tokenId: 0n, nft: false, npk: alice.npk, blinding: lpBlinding, ciphertext: lpCiphertext }];
+    const shields = [{ token: lpAddress, tokenId: 0n, nft: false, ownerHash: await hash2(alice.npk, lpBlinding), ciphertext: lpCiphertext }];
     const proof = await proveTransact({
       root: rootA,
       token: BigInt(tokenAAddress),
@@ -540,6 +579,7 @@ describe("Lacuna pool", function () {
       protocolFee1: exitB.fee,
       relayRecipient: 0n,
       externalHash: callCommitment(calls, shields),
+      ciphertextHash: ciphertextHash("0x", "0x"),
       inputs: [await spendable(alice, noteA, tree), await spendable(alice, noteB, tree)],
       outputs: [emptyOutput(), emptyOutput()],
     });
@@ -550,7 +590,8 @@ describe("Lacuna pool", function () {
     expect(await lp.balanceOf(relayAddress)).to.equal(0n);
     expect(await tokenA.balanceOf(relayAddress)).to.equal(0n);
     expect(await tokenB.balanceOf(relayAddress)).to.equal(0n);
-    expect(await lp.balanceOf(treasury.address)).to.equal(lpNote.fee);
+    expect(await lp.balanceOf(treasury.address)).to.equal(0n);
+    expect(await pool.feeBalance(BigInt(lpAddress))).to.equal(lpNote.fee);
   });
 
   it("shields, sends, and unshields an NFT, and returns one from a position call", async function () {
@@ -569,8 +610,7 @@ describe("Lacuna pool", function () {
     await pool.connect(aliceSigner).shieldERC721(
       nftAddress,
       7n,
-      alice.npk,
-      shielding,
+      await hash2(alice.npk, shielding),
       encryptNote({ value: 1n, blinding: shielding, token: tokenField }, alice.viewingPublic),
     );
     expect(await nft.ownerOf(7n)).to.equal(poolAddress);
@@ -587,7 +627,7 @@ describe("Lacuna pool", function () {
     );
     expect(decryptNote(sendCiphertext, bob.viewingPrivate)?.memo).to.equal(memo);
     expect(decryptNote(sendCiphertext, bob.viewingPrivate)?.sender).to.equal(aliceSigner.address.toLowerCase());
-    await submitTransact({
+    const privateNft = await submitTransact({
       signer: aliceSigner,
       pool: poolAddress,
       root: tree.tree(aliceNote.treeNumber).path(aliceNote.index).root,
@@ -596,6 +636,7 @@ describe("Lacuna pool", function () {
       outputs: [outputOf(1n, bob.npk, sendBlinding, tokenField), emptyOutput()],
       ciphertexts: [sendCiphertext, "0x"],
     });
+    expect(BigInt(privateNft.proof.pubSignals[8])).to.equal(0n);
     expect(await nft.ownerOf(7n)).to.equal(poolAddress);
     tree = await loadTree(ethers.provider, poolAddress);
     const bobNote = (await scan(ethers.provider, poolAddress, bob)).find((note) => !note.spent);
@@ -644,8 +685,7 @@ describe("Lacuna pool", function () {
     await pool.connect(aliceSigner).shieldERC721(
       nftAddress,
       8n,
-      alice.npk,
-      positionBlinding,
+      await hash2(alice.npk, positionBlinding),
       encryptNote({ value: 1n, blinding: positionBlinding, token: positionField }, alice.viewingPublic),
     );
 
@@ -684,8 +724,7 @@ describe("Lacuna pool", function () {
         token: nftAddress,
         tokenId: 8n,
         nft: true,
-        npk: alice.npk,
-        blinding: returnedBlinding,
+        ownerHash: await hash2(alice.npk, returnedBlinding),
         ciphertext: returnedCiphertext,
       },
     ];
@@ -702,6 +741,7 @@ describe("Lacuna pool", function () {
       protocolFee1: 0n,
       relayRecipient: 0n,
       externalHash: callCommitment(calls, shields),
+      ciphertextHash: ciphertextHash("0x", "0x"),
       inputs: [await spendable(alice, paymentNote, tree), await spendable(alice, nftNote, tree)],
       outputs: [emptyOutput(), emptyOutput()],
     });
@@ -723,5 +763,127 @@ describe("Lacuna pool", function () {
     expect(await nft.ownerOf(8n)).to.equal(poolAddress);
     expect(await payment.balanceOf(relayAddress)).to.equal(0n);
     expect(await payment.balanceOf(positionAddress)).to.equal(exit.net);
+  });
+
+  it("rejects a proof with no inputs and a fee-on-transfer token", async function () {
+    const [, treasury, aliceSigner] = await ethers.getSigners();
+    const alice = await createWallet();
+    const { pool } = await deployCore(treasury.address);
+    const poolAddress = await pool.getAddress();
+    const empty = await proveTransact({
+      root: await pool.currentRoot(),
+      token: 0n,
+      publicAmount: 0n,
+      recipient: 0n,
+      relayFee: 0n,
+      protocolFee: 0n,
+      relayRecipient: 0n,
+      externalHash: 0n,
+      ciphertextHash: ciphertextHash("0x", "0x"),
+      inputs: [emptySpend(), emptySpend()],
+      outputs: [emptyOutput(), emptyOutput()],
+    });
+    await expect(
+      pool.transact(empty.pA, empty.pB, empty.pC, empty.pubSignals, "0x", "0x", noNft, noNft),
+    ).to.be.revertedWithCustomError(pool, "BadValue");
+
+    const tax = await ethers.deployContract("TestTaxToken");
+    const amount = 1_000_000n;
+    await tax.mint(aliceSigner.address, amount);
+    await tax.connect(aliceSigner).approve(poolAddress, amount);
+    await expect(
+      pool.connect(aliceSigner).shieldERC20(
+        await tax.getAddress(),
+        amount,
+        await hash2(alice.npk, randomBlinding()),
+        "0x",
+      ),
+    ).to.be.revertedWithCustomError(pool, "FeeOnTransfer");
+  });
+
+  it("recovers a shield when the ciphertext still carries the gross amount", async function () {
+    const [, treasury, aliceSigner] = await ethers.getSigners();
+    const alice = await createWallet();
+    const { pool } = await deployCore(treasury.address);
+    const poolAddress = await pool.getAddress();
+    const gross = 1_000_000n;
+    const shielded = splitGross(gross);
+    const blinding = randomBlinding();
+    await pool.connect(aliceSigner).shieldETH(
+      await hash2(alice.npk, blinding),
+      encryptNote({ value: gross, blinding, token: 0n }, alice.viewingPublic),
+      { value: gross },
+    );
+    const notes = await scan(ethers.provider, poolAddress, alice);
+    expect(notes.map((note) => note.value)).to.deep.equal([shielded.net]);
+  });
+
+  it("pays a relay tip to the named wallet and not to the relay", async function () {
+    const [, treasury, aliceSigner, tipSigner] = await ethers.getSigners();
+    const alice = await createWallet();
+    const { pool } = await deployCore(treasury.address);
+    const poolAddress = await pool.getAddress();
+    const relay = await ethers.deployContract("LacunaRelay", [poolAddress]);
+    const relayAddress = await relay.getAddress();
+    await pool.setRelay(relayAddress);
+    const sink = await ethers.deployContract("TestSink");
+    const gross = 10n ** 18n;
+    await shieldEth({
+      signer: aliceSigner,
+      pool: poolAddress,
+      gross,
+      npk: alice.npk,
+      blinding: randomBlinding(),
+      viewingPublic: alice.viewingPublic,
+    });
+    const tree = await loadTree(ethers.provider, poolAddress);
+    const note = (await scan(ethers.provider, poolAddress, alice))[0];
+    const relayFee = 10n ** 15n;
+    const protocolFee = splitGross(note.value, await pool.unshieldFeeBps()).fee;
+    const publicNet = note.value - relayFee - protocolFee;
+    const calls = [{ target: await sink.getAddress(), value: 0n, data: sink.interface.encodeFunctionData("bounce") }];
+    const shields: [] = [];
+    const bypass = await proveTransact({
+      root: tree.tree(note.treeNumber).path(note.index).root,
+      token: 0n,
+      publicAmount: 0n,
+      recipient: 0n,
+      relayFee: note.value,
+      protocolFee: 0n,
+      relayRecipient: BigInt(tipSigner.address),
+      externalHash: 0n,
+      ciphertextHash: ciphertextHash("0x", "0x"),
+      inputs: [await spendable(alice, note, tree), emptySpend()],
+      outputs: [emptyOutput(), emptyOutput()],
+    });
+    await expect(
+      pool.transact(bypass.pA, bypass.pB, bypass.pC, bypass.pubSignals, "0x", "0x", noNft, noNft),
+    ).to.be.revertedWithCustomError(pool, "BadFee");
+    const shared = {
+      root: tree.tree(note.treeNumber).path(note.index).root,
+      token: 0n,
+      publicAmount: publicNet,
+      recipient: BigInt(relayAddress),
+      relayFee,
+      protocolFee,
+      externalHash: callCommitment(calls, shields),
+      ciphertextHash: ciphertextHash("0x", "0x"),
+      inputs: [await spendable(alice, note, tree), emptySpend()] as [Awaited<ReturnType<typeof spendable>>, ReturnType<typeof emptySpend>],
+      outputs: [emptyOutput(), emptyOutput()] as [ReturnType<typeof emptyOutput>, ReturnType<typeof emptyOutput>],
+    };
+    const toRelay = await proveTransact({ ...shared, relayRecipient: BigInt(relayAddress) });
+    await expect(
+      relay.transactAndCall(toRelay.pA, toRelay.pB, toRelay.pC, toRelay.pubSignals, "0x", "0x", noNft, noNft, calls, shields),
+    ).to.be.revertedWithCustomError(relay, "BadCall");
+
+    const tipBefore = await ethers.provider.getBalance(tipSigner.address);
+    const relayBefore = await ethers.provider.getBalance(relayAddress);
+    const feesBefore = await pool.feeBalance(0);
+    const toTip = await proveTransact({ ...shared, relayRecipient: BigInt(tipSigner.address) });
+    await relay.transactAndCall(toTip.pA, toTip.pB, toTip.pC, toTip.pubSignals, "0x", "0x", noNft, noNft, calls, shields);
+    expect(await ethers.provider.getBalance(relayAddress) - relayBefore).to.equal(publicNet);
+    expect(await ethers.provider.getBalance(tipSigner.address) - tipBefore).to.equal(relayFee);
+    expect(await pool.feeBalance(0)).to.equal(feesBefore + protocolFee);
+    expect(await pool.poolBalance(0)).to.equal(0n);
   });
 });

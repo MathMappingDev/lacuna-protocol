@@ -38,7 +38,7 @@ contract LacunaRelay is ReentrancyGuard, IERC721Receiver {
         uint256[2] calldata pA,
         uint256[2][2] calldata pB,
         uint256[2] calldata pC,
-        uint256[16] calldata pubSignals,
+        uint256[17] calldata pubSignals,
         bytes calldata ciphertext0,
         bytes calldata ciphertext1,
         LacunaPool.NftLeg calldata nft0,
@@ -48,7 +48,6 @@ contract LacunaRelay is ReentrancyGuard, IERC721Receiver {
     ) external nonReentrant {
         if (calls.length == 0 || calls.length > MAX_CALLS || shields.length > MAX_SHIELDS) revert BadCall();
         if (pubSignals[7] != uint256(uint160(address(this)))) revert BadCall();
-        if (pubSignals[11] != 0) revert BadCall();
         if (pubSignals[15] != pool.callCommitment(calls, shields)) revert BadCall();
 
         uint256 ethFloor = address(this).balance;
@@ -57,7 +56,7 @@ contract LacunaRelay is ReentrancyGuard, IERC721Receiver {
         uint256[] memory bases = new uint256[](shields.length);
         bool[] memory owned = new bool[](shields.length);
         for (uint256 i = 0; i < shields.length; i++) {
-            if (shields[i].npk == 0) revert BadCall();
+            if (shields[i].ownerHash == 0) revert BadCall();
             for (uint256 j = 0; j < i; j++) {
                 if (
                     shields[j].token == shields[i].token &&
@@ -86,7 +85,12 @@ contract LacunaRelay is ReentrancyGuard, IERC721Receiver {
             if (shields[i].nft) {
                 if (owned[i] || !_owns(shields[i].token, shields[i].tokenId)) continue;
                 IERC721(shields[i].token).approve(address(pool), shields[i].tokenId);
-                pool.shieldERC721(shields[i].token, shields[i].tokenId, shields[i].npk, shields[i].blinding, shields[i].ciphertext);
+                pool.shieldERC721(
+                    shields[i].token,
+                    shields[i].tokenId,
+                    shields[i].ownerHash,
+                    shields[i].ciphertext
+                );
             } else {
                 uint256 gained = _balance(shields[i].token) - bases[i];
                 if (gained == 0) continue;
@@ -116,12 +120,12 @@ contract LacunaRelay is ReentrancyGuard, IERC721Receiver {
 
     function _shield(LacunaPool.ShieldPlan calldata plan, uint256 amount) internal {
         if (plan.token == address(0)) {
-            pool.shieldETH{value: amount}(plan.npk, plan.blinding, plan.ciphertext);
+            pool.shieldETH{value: amount}(plan.ownerHash, plan.ciphertext);
             return;
         }
         IERC20(plan.token).safeApprove(address(pool), 0);
         IERC20(plan.token).safeApprove(address(pool), amount);
-        pool.shieldERC20(plan.token, amount, plan.npk, plan.blinding, plan.ciphertext);
+        pool.shieldERC20(plan.token, amount, plan.ownerHash, plan.ciphertext);
         IERC20(plan.token).safeApprove(address(pool), 0);
     }
 

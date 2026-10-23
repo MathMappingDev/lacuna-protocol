@@ -17,7 +17,7 @@ The deploy script publishes these contracts, in order, from the wallet in `.env`
 
 The deployer wallet becomes the owner and, unless you set another address, the treasury.
 
-The owner can set the shield fee and the unshield fee from 0% to 1%. Both start at 0.20%. The owner cannot pause the pool, withdraw the notes, or hand the owner key to someone else.
+The owner can set the shield fee and the unshield fee from 0% to 1%. Both start at 0.20%. The owner cannot pause the pool, withdraw the notes, or hand the owner key to someone else. Protocol fees stay in the pool until the treasury calls `withdrawFees`. That call pays only the accrued fees. It cannot take the note balances.
 
 ## Before you start
 
@@ -44,7 +44,7 @@ DEPLOYER_PRIVATE_KEY=0xYOUR_PRIVATE_KEY
 TREASURY_ADDRESS=
 ```
 
-`DEPLOYER_PRIVATE_KEY` is the only required value. Leave `TREASURY_ADDRESS` empty to send protocol fees to the deployer. Put a different address there if the fees should go somewhere else.
+`DEPLOYER_PRIVATE_KEY` is the only required value. Leave `TREASURY_ADDRESS` empty to name the deployer as the treasury. Put a different address there if someone else should be the only account that can call `withdrawFees`.
 
 Do not commit `.env`. It is listed in `.gitignore`.
 
@@ -58,11 +58,13 @@ When it finishes, the addresses are printed and saved to `deployments/sepolia.js
 
 ## After deployment
 
-Shield, private send, and unshield go to the pool. A call into another contract, such as a swap or a liquidity add, goes through the relay. The proof names the calls and the tokens that should be shielded afterwards.
+Shield, private send, and unshield go to the pool. A call into another contract, such as a swap or a liquidity add, goes through the relay. The proof names the calls and the tokens that should be shielded afterwards. Name every token the calls should return, including leftover of the token you sold. A token that arrives and is not named stays on the relay, and a later call can take it. A shield or a relay re-shield takes `ownerHash`, which is the Poseidon hash of the note key and its blinding factor. The note key itself is not in the transaction.
 
-Private addresses from the SDK start with `0LcnZK`.
+Private addresses from the SDK start with `0LcnZK`, then the note key and viewing key, then an 8-character checksum. An address with a flipped character is rejected.
 
-The verifier in `contracts/LacunaVerifier.sol` matches `circuits/build/transact_final.zkey`. Deploy this repository as it is. Rebuilding the circuit creates a new verifier, and that verifier has to be deployed again.
+The SDK writes the secrets of every output note to `lacuna-output-secrets.json` before it broadcasts. That file can spend nothing by itself, but it can identify the notes. Do not commit it.
+
+The verifier in `contracts/LacunaVerifier.sol` matches `circuits/build/transact_final.zkey`. Deploy this repository as it is. Rebuilding the circuit creates a new verifier, and that verifier has to be deployed again. Do not deploy an older commit of this repository. The first deployment has to be this version.
 
 ## Checks before a deploy
 

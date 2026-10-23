@@ -1,4 +1,4 @@
-export { BPS, FEE_BPS, FIELD, LEVELS, MAX_AMOUNT, feeOf, splitGross } from "./constants";
+export { BPS, FEE_BPS, FIELD, LEVELS, MAX_AMOUNT, feeOf, minProtocolFee, splitGross } from "./constants";
 export { ADDRESS_PREFIX, createWallet, formatAddress, keysFromPhrase, parseAddress, randomBlinding } from "./keys";
 export type { LacunaKeys } from "./keys";
 export { decryptNote, encryptNote } from "./note";
@@ -10,6 +10,7 @@ export {
   poolAbi,
   poolContract,
   callCommitment,
+  ciphertextHash,
   emptyNft,
   nftId,
   scan,

@@ -8,6 +8,6 @@ interface ILacunaVerifier {
         uint256[2] calldata pA,
         uint256[2][2] calldata pB,
         uint256[2] calldata pC,
-        uint256[16] calldata pubSignals
+        uint256[17] calldata pubSignals
     ) external view returns (bool);
 }

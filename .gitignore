@@ -4,6 +4,7 @@ artifacts
 typechain-types
 dist
 .env
+lacuna-output-secrets.json
 circuits/build/*.ptau
 circuits/build/*.r1cs
 circuits/build/*.sym

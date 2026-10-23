@@ -26,9 +26,9 @@ export async function commitmentOf(
   blinding: bigint,
   token: bigint,
 ): Promise<bigint> {
-  const left = await hash2(value, npk);
-  const right = await hash2(blinding, token);
-  return hash2(left, right);
+  const ownerHash = await hash2(npk, blinding);
+  const left = await hash2(value, token);
+  return hash2(left, ownerHash);
 }
 
 export async function npkOf(spendingKey: bigint): Promise<bigint> {

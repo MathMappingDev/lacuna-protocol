@@ -22,7 +22,6 @@ contract LacunaPool is ReentrancyGuard, IERC721Receiver {
     using SafeERC20 for IERC20;
 
     uint256 public constant LEVELS = 16;
-    uint256 public constant ROOT_HISTORY = 100;
     uint256 public constant MAX_FEE_BPS = 100;
     uint256 public constant BPS_DENOMINATOR = 10000;
     uint256 public shieldFeeBps = 20;
@@ -44,16 +43,17 @@ contract LacunaPool is ReentrancyGuard, IERC721Receiver {
 
     uint256 public treeNumber;
     uint256 public nextIndex;
+    uint256 private _currentRoot;
     uint256[LEVELS] public filledSubtrees;
     uint256[LEVELS] public zeros;
-    uint256[ROOT_HISTORY] public roots;
-    uint32 public currentRootIndex;
 
     mapping(uint256 => bool) public nullified;
     mapping(uint256 => bool) public commitmentUsed;
     mapping(uint256 => uint256) public poolBalance;
-    /// @dev Roots kept after a tree is closed. The active tree still uses the ring above.
-    mapping(uint256 => bool) public archivedRoot;
+    /// @dev Protocol fees waiting for the treasury to pull them. Separate from note balances.
+    mapping(uint256 => uint256) public feeBalance;
+    /// @dev Every root ever accepted. A later deposit cannot push an older proof out.
+    mapping(uint256 => bool) public rootSeen;
 
     event Note(uint256 indexed treeNumber, uint256 indexed leafIndex, uint256 commitment, bytes ciphertext);
     event Nullified(uint256 indexed nullifier);
@@ -73,6 +73,8 @@ contract LacunaPool is ReentrancyGuard, IERC721Receiver {
     error NotOwner();
     error DoubleSpend();
     error CiphertextTooLarge();
+    error NotTreasury();
+    error FeeOnTransfer();
 
     constructor(address hasher_, address verifier_, address treasury_) {
         if (hasher_ == address(0) || verifier_ == address(0) || treasury_ == address(0)) revert BadValue();
@@ -89,22 +91,26 @@ contract LacunaPool is ReentrancyGuard, IERC721Receiver {
             zeros[i] = current;
             filledSubtrees[i] = current;
         }
-        roots[0] = hasher.hash2(zeros[LEVELS - 1], zeros[LEVELS - 1]);
+        _currentRoot = hasher.hash2(zeros[LEVELS - 1], zeros[LEVELS - 1]);
+        rootSeen[_currentRoot] = true;
     }
 
     function currentRoot() external view returns (uint256) {
-        return roots[currentRootIndex];
+        return _currentRoot;
     }
 
     function isKnownRoot(uint256 root) public view returns (bool) {
-        if (root == 0) return false;
-        if (archivedRoot[root]) return true;
-        uint32 index = currentRootIndex;
-        for (uint256 i = 0; i < ROOT_HISTORY; i++) {
-            if (roots[index] == root) return true;
-            index = index == 0 ? uint32(ROOT_HISTORY - 1) : index - 1;
-        }
-        return false;
+        return root != 0 && rootSeen[root];
+    }
+
+    /// @notice Treasury pulls protocol fees. This cannot touch note balances.
+    function withdrawFees(address token) external nonReentrant {
+        if (msg.sender != treasury) revert NotTreasury();
+        uint256 id = tokenIdOf(token);
+        uint256 amount = feeBalance[id];
+        if (amount == 0) revert BadValue();
+        feeBalance[id] = 0;
+        _pay(token, treasury, amount);
     }
 
     /// @dev Tests use a smaller capacity. Production uses the full depth.
@@ -146,8 +152,7 @@ contract LacunaPool is ReentrancyGuard, IERC721Receiver {
         address token;
         uint256 tokenId;
         bool nft;
-        uint256 npk;
-        uint256 blinding;
+        uint256 ownerHash;
         bytes ciphertext;
     }
 
@@ -179,33 +184,30 @@ contract LacunaPool is ReentrancyGuard, IERC721Receiver {
         unshieldFeeBps = bps;
     }
 
-    /// @param npk Note public key, poseidon(spendingKey, 1).
-    /// @param blinding Random 128-bit mask chosen by the sender.
-    function shieldETH(uint256 npk, uint256 blinding, bytes calldata ciphertext) external payable nonReentrant {
+    /// @param ownerHash poseidon(npk, blinding). The note key itself stays off the chain.
+    function shieldETH(uint256 ownerHash, bytes calldata ciphertext) external payable nonReentrant {
         if (msg.value == 0 || msg.value >= MAX_AMOUNT) revert BadValue();
         uint256 fee = (msg.value * shieldFeeBps) / BPS_DENOMINATOR;
         uint256 net = msg.value - fee;
-        _shield(ETH, npk, blinding, net, ciphertext);
-        if (fee > 0) {
-            (bool ok, ) = treasury.call{value: fee}("");
-            if (!ok) revert BadValue();
-        }
+        _shield(ETH, ownerHash, net, ciphertext);
+        feeBalance[tokenIdOf(ETH)] += fee;
         emit Shielded(msg.sender, ETH, msg.value, fee);
     }
 
     function shieldERC20(
         address token,
         uint256 amount,
-        uint256 npk,
-        uint256 blinding,
+        uint256 ownerHash,
         bytes calldata ciphertext
     ) external nonReentrant {
         if (token == ETH || amount == 0 || amount >= MAX_AMOUNT) revert BadValue();
+        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        if (IERC20(token).balanceOf(address(this)) - beforeBalance != amount) revert FeeOnTransfer();
         uint256 fee = (amount * shieldFeeBps) / BPS_DENOMINATOR;
         uint256 net = amount - fee;
-        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
-        _shield(token, npk, blinding, net, ciphertext);
-        if (fee > 0) IERC20(token).safeTransfer(treasury, fee);
+        _shield(token, ownerHash, net, ciphertext);
+        feeBalance[tokenIdOf(token)] += fee;
         emit Shielded(msg.sender, token, amount, fee);
     }
 
@@ -213,37 +215,46 @@ contract LacunaPool is ReentrancyGuard, IERC721Receiver {
     function shieldERC721(
         address collection,
         uint256 id,
-        uint256 npk,
-        uint256 blinding,
+        uint256 ownerHash,
         bytes calldata ciphertext
     ) external nonReentrant {
         if (collection == address(0)) revert BadValue();
         uint256 tokenField = nftId(collection, id);
         if (tokenField <= type(uint160).max) revert BadValue();
         IERC721(collection).safeTransferFrom(msg.sender, address(this), id);
-        _insertNote(tokenField, npk, blinding, 1, ciphertext);
+        _insertNote(tokenField, ownerHash, 1, ciphertext);
         emit Shielded(msg.sender, collection, 1, 0);
+    }
+
+    function ciphertextCommitment(bytes calldata first, bytes calldata second) public pure returns (uint256) {
+        return uint256(keccak256(abi.encode(first, second))) % FIELD;
     }
 
     /// @notice Public signals, in order:
     /// merkleRoot, nullifier0, nullifier1, commitment0, commitment1,
     /// publicAmount0, publicAmount1, recipient, token0, token1, twoTokens,
-    /// relayFee, protocolFee0, protocolFee1, relayRecipient, externalHash.
-    /// Each protocol fee is the unshield fee for that exit. A private send has none.
+    /// relayFee, protocolFee0, protocolFee1, relayRecipient, externalHash, ciphertextHash.
+    /// Each protocol fee covers the unshield fee for the value leaving that bucket.
+    /// The first bucket's fee covers the recipient amount and the broadcaster tip.
+    /// A send that leaves nothing in public pays no fee.
+    /// A private send publishes token id 0. The token is revealed only when value leaves the pool.
     /// relayFee is paid from token0 to relayRecipient.
     /// externalHash locks the relay's call list and the tokens it shields afterwards.
+    /// ciphertextHash locks the two encrypted notes.
     /// An ERC-721 exit sets the matching NftLeg. Its public amount is 1 and its fee is 0.
     function transact(
         uint256[2] calldata pA,
         uint256[2][2] calldata pB,
         uint256[2] calldata pC,
-        uint256[16] calldata pubSignals,
+        uint256[17] calldata pubSignals,
         bytes calldata ciphertext0,
         bytes calldata ciphertext1,
         NftLeg calldata nft0,
         NftLeg calldata nft1
     ) external nonReentrant {
         if (!verifier.verifyProof(pA, pB, pC, pubSignals)) revert BadProof();
+        if (pubSignals[1] == 0 && pubSignals[2] == 0) revert BadValue();
+        if (pubSignals[16] != ciphertextCommitment(ciphertext0, ciphertext1)) revert BadProof();
         _checkPublic(pubSignals, nft1);
         _spend(pubSignals[1]);
         _spend(pubSignals[2]);
@@ -254,14 +265,14 @@ contract LacunaPool is ReentrancyGuard, IERC721Receiver {
         _exit(pubSignals[9], pubSignals[6], pubSignals[13], 0, pubSignals[7], 0, nft1);
     }
 
-    function _checkPublic(uint256[16] calldata pub, NftLeg calldata nft1) internal view {
+    function _checkPublic(uint256[17] calldata pub, NftLeg calldata nft1) internal view {
         if (!isKnownRoot(pub[0])) revert BadRoot();
         if (pub[10] > 1) revert BadValue();
         if (pub[5] >= MAX_AMOUNT || pub[6] >= MAX_AMOUNT || pub[11] >= MAX_AMOUNT) revert BadValue();
         if (pub[12] >= MAX_AMOUNT || pub[13] >= MAX_AMOUNT) revert BadValue();
         if (pub[10] == 0 && (pub[9] != 0 || pub[6] != 0 || pub[13] != 0 || nft1.collection != address(0))) revert BadValue();
-        _checkFee(pub[5], pub[12]);
-        _checkFee(pub[6], pub[13]);
+        _checkFee(pub[5], pub[12], pub[11]);
+        _checkFee(pub[6], pub[13], 0);
         if (pub[11] == 0) {
             if (pub[14] != 0) revert BadValue();
         } else if (pub[14] == 0 || pub[14] > type(uint160).max) {
@@ -275,8 +286,8 @@ contract LacunaPool is ReentrancyGuard, IERC721Receiver {
         }
     }
 
-    function _checkFee(uint256 amount, uint256 fee) internal view {
-        if (fee != ((amount + fee) * unshieldFeeBps) / BPS_DENOMINATOR) revert BadFee();
+    function _checkFee(uint256 amount, uint256 fee, uint256 relayFee) internal view {
+        if (fee < ((amount + fee + relayFee) * unshieldFeeBps) / BPS_DENOMINATOR) revert BadFee();
     }
 
     function _exit(
@@ -301,29 +312,23 @@ contract LacunaPool is ReentrancyGuard, IERC721Receiver {
         uint256 payout = amount + fee + relayFee;
         if (poolBalance[token] < payout) revert BadValue();
         poolBalance[token] -= payout;
+        feeBalance[token] += fee;
         address tokenAddress = address(uint160(token));
         address to = address(uint160(recipient));
-        _pay(tokenAddress, treasury, fee);
         _pay(tokenAddress, address(uint160(relayTo)), relayFee);
         _pay(tokenAddress, to, amount);
         emit PublicExit(tokenAddress, to, amount, fee, relayFee);
     }
 
-    function _shield(address token, uint256 npk, uint256 blinding, uint256 net, bytes calldata ciphertext) internal {
+    function _shield(address token, uint256 ownerHash, uint256 net, bytes calldata ciphertext) internal {
         uint256 tokenField = tokenIdOf(token);
-        _insertNote(tokenField, npk, blinding, net, ciphertext);
+        _insertNote(tokenField, ownerHash, net, ciphertext);
         poolBalance[tokenField] += net;
     }
 
-    function _insertNote(
-        uint256 tokenField,
-        uint256 npk,
-        uint256 blinding,
-        uint256 net,
-        bytes calldata ciphertext
-    ) internal {
-        if (npk >= FIELD || blinding >= FIELD || net == 0 || net >= MAX_AMOUNT) revert BadValue();
-        uint256 commitment = hasher.hash2(hasher.hash2(net, npk), hasher.hash2(blinding, tokenField));
+    function _insertNote(uint256 tokenField, uint256 ownerHash, uint256 net, bytes calldata ciphertext) internal {
+        if (ownerHash == 0 || ownerHash >= FIELD || net == 0 || net >= MAX_AMOUNT) revert BadValue();
+        uint256 commitment = hasher.hash2(hasher.hash2(net, tokenField), ownerHash);
         _insert(commitment, ciphertext);
     }
 
@@ -353,16 +358,13 @@ contract LacunaPool is ReentrancyGuard, IERC721Receiver {
             currentIndex /= 2;
         }
         nextIndex = index + 1;
-        currentRootIndex = (currentRootIndex + 1) % uint32(ROOT_HISTORY);
-        roots[currentRootIndex] = current;
+        _currentRoot = current;
+        rootSeen[current] = true;
         commitmentUsed[commitment] = true;
         emit Note(treeNumber, index, commitment, ciphertext);
     }
 
     function _rollTree() internal {
-        for (uint256 i = 0; i < ROOT_HISTORY; i++) {
-            if (roots[i] != 0) archivedRoot[roots[i]] = true;
-        }
         for (uint256 level = 0; level < LEVELS; level++) {
             filledSubtrees[level] = zeros[level];
         }

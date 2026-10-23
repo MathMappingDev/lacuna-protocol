@@ -42,6 +42,7 @@ export type TransactRequest = {
   protocolFee1?: bigint;
   relayRecipient: bigint;
   externalHash: bigint;
+  ciphertextHash: bigint;
   inputs: [SpendNote, SpendNote];
   outputs: [OutputNote, OutputNote];
 };
@@ -87,6 +88,8 @@ export async function proveTransact(request: TransactRequest): Promise<ProofCall
   const token1 = twoTokens === 1n ? (request.token1 ?? 0n) : 0n;
   const publicAmount1 = twoTokens === 1n ? (request.publicAmount1 ?? 0n) : 0n;
   const protocolFee1 = twoTokens === 1n ? (request.protocolFee1 ?? 0n) : 0n;
+  const token0Public = request.publicAmount + request.protocolFee + request.relayFee > 0n ? request.token : 0n;
+  const token1Public = publicAmount1 + protocolFee1 > 0n ? token1 : 0n;
   const inputTokens = request.inputs.map((note) => noteToken(note.enabled, note.token, request.token));
   const outputTokens = request.outputs.map((note) => noteToken(note.enabled, note.token, request.token));
   const inputCommitments = await Promise.all(
@@ -116,14 +119,17 @@ export async function proveTransact(request: TransactRequest): Promise<ProofCall
     publicAmount0: asDec(request.publicAmount),
     publicAmount1: asDec(publicAmount1),
     recipient: asDec(request.recipient),
-    token0: asDec(request.token),
-    token1: asDec(token1),
+    token0: asDec(token0Public),
+    token1: asDec(token1Public),
     twoTokens: asDec(twoTokens),
     relayFee: asDec(request.relayFee),
     protocolFee0: asDec(request.protocolFee),
     protocolFee1: asDec(protocolFee1),
     relayRecipient: asDec(request.relayRecipient),
     externalHash: asDec(request.externalHash),
+    ciphertextHash: asDec(request.ciphertextHash),
+    privateToken0: asDec(request.token),
+    privateToken1: asDec(token1),
     inValue: request.inputs.map((note) => asDec(note.enabled ? note.value : 0n)),
     inNpk: request.inputs.map((note) => asDec(note.enabled ? note.npk : 0n)),
     inBlinding: request.inputs.map((note) => asDec(note.blinding)),
@@ -149,14 +155,15 @@ export async function proveTransact(request: TransactRequest): Promise<ProofCall
     request.publicAmount,
     publicAmount1,
     request.recipient,
-    request.token,
-    token1,
+    token0Public,
+    token1Public,
     twoTokens,
     request.relayFee,
     request.protocolFee,
     protocolFee1,
     request.relayRecipient,
     request.externalHash,
+    request.ciphertextHash,
   ];
   let signals = (proof.publicSignals as string[]).map((value) => BigInt(value));
   if (signals.length === expected.length + 1 && signals[0] === 1n) signals = signals.slice(1);

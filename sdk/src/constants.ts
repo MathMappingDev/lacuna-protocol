@@ -13,3 +13,17 @@ export function splitGross(gross: bigint, feeBps: bigint = FEE_BPS): { fee: bigi
   const fee = feeOf(gross, feeBps);
   return { fee, net: gross - fee };
 }
+
+/// Smallest protocol fee for a net amount that leaves the pool, including a tip.
+/// A 1-unit exit still rounds down to a zero fee.
+export function minProtocolFee(netLeaving: bigint, feeBps: bigint = FEE_BPS): bigint {
+  if (netLeaving === 0n || feeBps === 0n) return 0n;
+  let low = 0n;
+  let high = (netLeaving * feeBps) / (BPS - feeBps) + 1n;
+  while (low < high) {
+    const mid = (low + high) / 2n;
+    if (mid < ((netLeaving + mid) * feeBps) / BPS) low = mid + 1n;
+    else high = mid;
+  }
+  return low;
+}

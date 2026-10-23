@@ -18,16 +18,26 @@ function u256Hex(value: bigint): string {
 }
 
 export const ADDRESS_PREFIX = "0LcnZK";
+const ADDRESS_BODY = 128;
+const ADDRESS_CHECKSUM = 8;
+
+function checksumOf(body: string): string {
+  return keccak256(toUtf8Bytes(`${ADDRESS_PREFIX}${body}`)).slice(2, 2 + ADDRESS_CHECKSUM);
+}
 
 export function formatAddress(npk: bigint, viewingPublic: Uint8Array): string {
-  return `${ADDRESS_PREFIX}${u256Hex(npk)}${Buffer.from(viewingPublic).toString("hex")}`;
+  const body = `${u256Hex(npk)}${Buffer.from(viewingPublic).toString("hex")}`;
+  return `${ADDRESS_PREFIX}${body}${checksumOf(body)}`;
 }
 
 export function parseAddress(address: string): { npk: bigint; viewingPublic: Uint8Array } {
-  if (!address.startsWith(ADDRESS_PREFIX) || address.length !== ADDRESS_PREFIX.length + 128) {
-    throw new Error("Lacuna address must start with 0LcnZK and contain the note key and viewing key");
+  const expected = ADDRESS_PREFIX.length + ADDRESS_BODY + ADDRESS_CHECKSUM;
+  if (!address.startsWith(ADDRESS_PREFIX) || address.length !== expected) {
+    throw new Error("Lacuna address must start with 0LcnZK and contain the note key, viewing key, and checksum");
   }
-  const body = address.slice(ADDRESS_PREFIX.length);
+  const body = address.slice(ADDRESS_PREFIX.length, ADDRESS_PREFIX.length + ADDRESS_BODY);
+  const checksum = address.slice(ADDRESS_PREFIX.length + ADDRESS_BODY);
+  if (checksum !== checksumOf(body)) throw new Error("Lacuna address checksum does not match");
   return {
     npk: BigInt(`0x${body.slice(0, 64)}`),
     viewingPublic: getBytes(`0x${body.slice(64)}`),
